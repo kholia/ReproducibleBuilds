@@ -1,0 +1,341 @@
+#!/bin/sh
+#
+# Copyright (c) 2013, "Steve Grubb <sgrubb@redhat.com>", Red Hat, Inc.
+# ALL RIGHTS RESERVED.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#    Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+#    Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#    Neither the name of Red Hat nor the names of author(s) may be used to
+# endorse or promote products derived from this software without specific
+# prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+version="0.3"
+
+if [ "$1" = "-v" ] ; then
+	echo "$version"
+	exit 0
+fi
+
+usage="Usage: rpm-compare [-v] [--verbose] rpm1 rpm2"
+if [ $# -eq 0 ] ; then
+	echo $usage
+	exit 1
+fi
+
+typeid() {
+	# Make sure the file exists. Ghost files do not
+	if [ ! -f $1 ] && [ ! -f $2 ] ; then
+		res="GHOST"
+		return
+	fi
+
+	# See if they are ELF format files
+	test1=`/usr/bin/file $1 2>/dev/null | grep ELF`
+	test2=`/usr/bin/file $2 2>/dev/null | grep ELF`
+	if [ x"$test1" != "x" ] ; then
+		if [ x"$test2" != "x" ] ; then
+			res="ELF"
+		else
+			res="MISMATCH"
+		fi
+		return
+	fi
+
+	# See if they are compiled python files
+	test1=`/usr/bin/file $1 2>/dev/null | grep 'python.*byte-compiled'`
+	test2=`/usr/bin/file $2 2>/dev/null | grep 'python.*byte-compiled'`
+	if [ x"$test1" != "x" ] ; then
+		if [ x"$test2" != "x" ] ; then
+			res="PY"
+		else
+			res="MISMATCH"
+		fi
+		return
+	fi
+
+	# See if they are java archives
+	test1=`echo $1 | grep '.jar$'`
+	if [ x"$test1" != "x" ] ; then
+		test1=`/usr/bin/file $1 2>/dev/null | grep 'Zip archive data'`
+		test2=`/usr/bin/file $2 2>/dev/null | grep 'Zip archive data'`
+		if [ x"$test1" != "x" ] ; then
+			if [ x"$test2" != "x" ] ; then
+				res="JAR"
+			else
+				res="MISMATCH"
+			fi
+			return
+		fi
+	fi
+
+	# Last check, if both are files then
+	if [ -L $1 ] && [ -L $2 ] ; then
+		res="LINKS"
+	elif [ -d $1 ] && [ -d $2 ] ; then
+		res="DIRS"
+	elif [ -f $1 ] && [ -f $2 ] ; then
+		res="FILES"
+	else
+		res="MISMATCH"
+	fi
+}
+
+# Make sure all parts are found
+if [ ! -x ./python-disassemble.py ] ; then
+	echo "Can't find ./python-disassemble.py script"
+	exit 1
+fi
+
+verbose=0
+file1=""
+file2=""
+while [ $# -ge 1 ]
+do
+	if [ "$1" = "--verbose" ] ; then
+		verbose=1
+	elif [ -f $1 ] ; then
+		if [ x"$file1" = "x" ] ; then
+			file1=`realpath $1`
+		elif [ x"$file2" = "x" ] ;then
+			file2=`realpath $1`
+		else
+			echo "$usage"
+			exit 1
+		fi
+	else
+		echo "$usage"
+		exit 1
+	fi
+	shift
+done
+
+# Verify we have everything
+if [ x"$file1" = "x" ] || [ x"$file2" = x ] ; then
+	echo "$usage"
+	exit 1
+fi
+
+# Memorize our location so we can come back to it.
+cwd=`pwd`
+trap "cd $cwd; rm -rf rpm1 rpm2; rm -f list1 list2 list3 list4; exit 1" 1 2 3 5 15
+
+# This cleanup should never be needed
+if [ -e rpm1 ] ; then
+	echo "Erasing rpm1 directory"
+	rm -rf rpm1
+fi
+if [ -e rpm2 ] ; then
+	echo "Erasing rpm2 directory"
+	rm -rf rpm2
+fi
+
+# Make the working dirs
+mkdir rpm1
+mkdir rpm2
+
+#Make sure nothing prevented making them
+if [ ! -d rpm1 ] ; then
+	echo "rpm1 dir does not exist"
+	exit 1
+fi
+if [ ! -d rpm2 ] ; then
+	echo "rpm2 dir does not exist"
+	exit 1
+fi
+
+cd rpm1
+if [ $? -ne 0 ] ; then
+	echo "Could not cd into rpm1 dir"
+	exit 1
+fi
+
+# Extract rpm1
+rpm2cpio $file1 | cpio -dim --no-absolute-filenames 2>/dev/null
+
+cd $cwd/rpm2
+if [ $? -ne 0 ] ; then
+	echo "Could not cd into rpm2 dir"
+	exit 1
+fi
+
+# Extract rpm2
+rpm2cpio $file2 | cpio -dim --no-absolute-filenames 2>/dev/null
+cd $cwd
+if [ $? -ne 0 ] ; then
+	echo "Could not cd into $cwd"
+	exit 1
+fi
+
+# Make a manifest list for quick compare. If the file lists are
+# different we have very different rpms and can stop right here.
+rpm -qpl $file1 > list1
+rpm -qpl $file2 > list2
+diff -u list1 list2 >/dev/null
+if [ $? -ne 0 ] ; then
+	echo "Difference found in package manifest:"
+	diff -u list1 list2
+	rm -f list1 list2
+	rm -rf rpm1 rpm2
+	exit 1
+fi
+
+# Check that pre/post scripts are the same
+rpm -qp --scripts $file1 > list3
+rpm -qp --scripts $file2 > list4
+diff -u list3 list4 >/dev/null
+if [ $? -ne 0 ] ; then
+	echo "Difference found in package scriptlets"
+	if [ $verbose -eq 1 ] ; then
+		diff -u list3 list4
+	fi
+	rm -f list1 list2
+	rm -f list3 list4
+	rm -rf rpm1 rpm2
+	exit 1
+fi
+
+# If we hit a package with no files, we are done. We only check
+# one because we already made sure manifests are the same.
+f=`cat list1 | grep -v '(contains no files)'`
+if [ x"$f" = "x" ] ; then
+	echo "Packages are the same"
+	rm -f list1 list2
+	rm -f list3 list4
+	rm -rf rpm1 rpm2
+	exit 0
+fi
+
+cnt=0
+
+# First we'll examine the rpm's internal scripts and attributes to
+# make sure they won't cause differences in the final system config.
+# File attributes: perms, links, owner, group, path
+rpm -qplv $file1 | awk '{ printf "%s %s %s %s %s\n", $9, $1, $2, $3, $4 }' > list3
+rpm -qplv $file2 | awk '{ printf "%s %s %s %s %s\n", $9, $1, $2, $3, $4 }' > list4
+diff -u list3 list4 >/dev/null
+if [ $? -ne 0 ] ; then
+	echo "Difference found in file attributes"
+	if [ $verbose -eq 1 ] ; then
+		diff -u list3 list4
+		echo ""
+	fi
+	cnt=`expr $cnt + 1`
+fi
+rm -f list3 list4
+
+# Now we will iterate through the package manifest and
+# check each file. We need to know the file type in a couple
+# cases so that the right kind of diff is done.
+res=""
+for f in `cat list1`
+do
+	# Figure out the file type and test it
+	typeid $cwd/rpm1/$f $cwd/rpm2/$f
+	case $res in
+		"ELF")
+			# If we get to here, both are ELF format
+			objdump -d rpm1/$f | grep -v $f > dump1
+			objdump -d rpm2/$f | grep -v $f > dump2
+			diff -u dump1 dump2 > /dev/null
+			if [ $? -ne 0 ] ; then
+				echo "File disassembly differs $f"
+				cnt=`expr $cnt + 1`
+				if [ $verbose -eq 1 ] ; then
+					diff -u dump1 dump2
+					echo ""
+				fi
+			fi
+			rm -f dump1 dump2
+			;;
+		"PY")
+			./python-disassemble.py rpm1/$f > dump1
+			./python-disassemble.py rpm2/$f > dump2
+			diff -u dump1 dump2 > /dev/null
+			if [ $? -ne 0 ] ; then
+				echo "Python disassembly differs $f"
+				cnt=`expr $cnt + 1`
+				if [ $verbose -eq 1 ] ; then
+					diff -u dump1 dump2
+					echo ""
+				fi
+			fi
+			rm -f dump1 dump2
+			;;
+		"FILES")
+			echo "$f" | grep '.hmac$'
+			if [ $? -eq 0 ] ; then
+				# Skip FIPS-140 hmac files
+				continue
+			fi
+			# Do simple hash compare.
+			h1=`sha256sum rpm1/$f | awk '{ print $1 }'`
+			h2=`sha256sum rpm2/$f | awk '{ print $1 }'`
+			if [ "$h1" != "$h2" ] ; then
+				echo "File hash differs $f"
+				cnt=`expr $cnt + 1`
+				if [ $verbose -eq 1 ] ; then
+					echo "$h1 $h2"
+					echo ""
+				fi
+			fi
+			;;
+		"LINKS")
+			# Compare what links point to
+			l1=`readlink rpm1/$f`
+			l2=`readlink rpm2/$f`
+			if [ "$l1" != "$l2" ] ; then
+				echo "File links differs $f"
+				cnt=`expr $cnt + 1`
+				if [ $verbose -eq 1 ] ; then
+					echo "$l1 $l2"
+					echo ""
+				fi
+			fi
+			continue
+			;;
+		"JAR")
+			# Take the jar files apart.
+			# They have time stamps inside
+			continue
+			;;
+		"GHOST")
+			# We skip ghost files...they don't exist
+			continue
+			;;
+		"MISMATCH")
+			echo "File type differs $f"
+			cnt=`expr $cnt + 1`
+			;;
+	esac
+done
+
+# Done cleanup
+rm -f list1 list2
+rm -rf rpm1 rpm2
+
+# Output the conclusion
+if [ $cnt -ne 0 ] ; then
+	echo "The packages differ in $cnt ways"
+	exit 1
+fi
+echo "The packages are the same"
+exit 0
+
